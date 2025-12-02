@@ -1,0 +1,6 @@
+*.log
+VOCdevkit/
+viz_dir/
+viz_edges/
+output_voc/
+pretrained/
