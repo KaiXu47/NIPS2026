@@ -179,6 +179,186 @@ class IncrementalPrototype(nn.Module):
         """
         return torch.cat(list(self.prototype), dim=0)
 
+
+class ResidualPrototypeModel(nn.Module):
+    def __init__(self, dim): # 注意：这里不需要传 num_classes 了
+        super().__init__()
+        
+        # 1. 全局静态原型 (The Anchor)
+        # 注意：这个 Parameter 还是需要在外部或者这里动态维护，但 Adapter 本身不再依赖它
+        # 如果你希望在这里管理 P，可以写一个方法来动态扩展它，见后文
+        
+        # 2. 残差生成器 (The Adapter)
+        # 改动点：现在的 Adapter 接收 (Image_Feat + Prototype) 作为输入
+        # 输入维度: dim (图像) + dim (原型) = 2 * dim
+        # 输出维度: dim (即 delta_p)
+        # 这样参数量就是固定的了！
+        self.res_adapter = nn.Sequential(
+            nn.Linear(dim * 2, dim),     # 融合 图像 和 原型
+            nn.LayerNorm(dim),           # 加个 Norm 训练更稳
+            nn.ReLU(),
+            nn.Linear(dim, dim // 2),    # 瓶颈层
+            nn.ReLU(),
+            nn.Linear(dim // 2, dim)     # 输出 delta
+        )
+        # 这种初始化保证初始 delta 为 0 (可选，有助于初期稳定)
+        nn.init.zeros_(self.res_adapter[-1].weight)
+        nn.init.zeros_(self.res_adapter[-1].bias)
+
+        self.dim = dim
+
+    def forward(self, fmap, global_prototypes):
+        """
+        fmap: [B, D, H, W]
+        global_prototypes: [C, D]  <-- C 可以是任意数量
+        """
+        B, D, H, W = fmap.shape
+        C = global_prototypes.shape[0] # 动态获取当前的类别数
+
+        # 1. 提取图像的全局上下文 [B, D]
+        img_context = F.adaptive_avg_pool2d(fmap, (1, 1)).flatten(1)
+        
+        # 2. 准备拼接输入
+        # 我们需要让 Batch 里的每张图，都和所有的 Prototype 进行交互
+        
+        # img_context: [B, D] -> [B, C, D] (复制 C 份)
+        img_expanded = img_context.unsqueeze(1).expand(-1, C, -1)
+        
+        # prototypes: [C, D] -> [B, C, D] (复制 B 份)
+        proto_expanded = global_prototypes.unsqueeze(0).expand(B, -1, -1)
+        
+        # 拼接: [B, C, 2*D]
+        combined_feat = torch.cat([img_expanded, proto_expanded], dim=-1)
+        
+        # 3. 通过 Class-Agnostic Adapter 生成残差
+        # Input: [B, C, 2*D] -> MLP -> Output: [B, C, D]
+        delta_p = self.res_adapter(combined_feat)
+        
+        # --- 叠加 ---
+        # Final P = Anchor + Delta
+        p_final = proto_expanded + delta_p
+        
+        # --- 分割预测 ---
+        p_final_norm = F.normalize(p_final, dim=2)
+        fmap_norm = F.normalize(fmap.flatten(2), dim=1)
+        logits = torch.bmm(p_final_norm, fmap_norm).view(B, C, H, W)
+        
+        return logits, delta_p, p_final
+
+
+class ResidualPrototypeModel_cross(nn.Module):
+    def __init__(self, dim, num_heads=4):
+        super().__init__()
+        
+        # 1. 全局静态原型 (The Anchor) - 依然从外部传入或这里维护
+        
+        # 2. 升级版 Adapter: 使用 Cross-Attention 而不是 GAP
+        # 这就是一个标准的 Transformer Decoder Layer (简化版)
+        self.cross_attn = nn.MultiheadAttention(
+            embed_dim=dim, 
+            num_heads=num_heads, 
+            batch_first=True
+        )
+        
+        # FFN (Feed Forward) 用于进一步处理特征
+        self.ffn = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.ReLU(),
+            nn.Linear(dim, dim)
+        )
+        
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        
+        #最后加一个缩放系数，初始化为0，保证初始状态下不干扰 P_global
+        self.output_scale = nn.Parameter(torch.zeros(1)) 
+
+    def forward(self, fmap, global_prototypes):
+        """
+        fmap: [B, D, H, W] -> 图像特征
+        global_prototypes: [C, D] -> 全局原型 (Query)
+        """
+        B, D, H, W = fmap.shape
+        C = global_prototypes.shape[0]
+
+        # 1. 准备 Key/Value (图像特征)
+        # [B, D, H, W] -> [B, H*W, D]
+        img_feats = fmap.flatten(2).transpose(1, 2)
+        
+        # 2. 准备 Query (全局原型)
+        # [C, D] -> [B, C, D] (为每个 batch 复制一份)
+        proto_query = global_prototypes.unsqueeze(0).expand(B, -1, -1)
+        
+        # 3. 计算 Cross-Attention (代替 GAP)
+        # Query 寻找它感兴趣的 Image Region
+        # attn_out: [B, C, D]
+        attn_out, _ = self.cross_attn(
+            query=proto_query, 
+            key=img_feats, 
+            value=img_feats
+        )
+        
+        # 4. 残差连接 + FFN (Standard Transformer Logic)
+        # 注意：这里我们把 attn_out 作为残差的基础
+        delta = self.norm1(attn_out) 
+        delta = self.norm2(delta + self.ffn(delta))
+        
+        # 5. 缩放控制 (防止初始化时波动太大)
+        delta_p = delta * self.output_scale
+
+        # --- 叠加 ---
+        p_final = proto_query + delta_p
+        
+        # --- 分割预测 (保持不变) ---
+        p_final_norm = F.normalize(p_final, dim=2)
+        fmap_norm = F.normalize(img_feats, dim=2).transpose(1, 2) # [B, D, HW]
+        logits = torch.bmm(p_final_norm, fmap_norm).view(B, C, H, W)
+        
+        return logits, delta_p, p_final
+
+#分类别的残差token
+class ResidualPrototypeModel_v1(nn.Module):
+    def __init__(self, dim, num_classes):
+        super().__init__()
+        # 1. 全局静态原型 (The Anchor)
+        
+        # 2. 残差生成器 (The Adapter)
+        # 输入: fmap [B, D, H, W]
+        # 输出: delta_P [B, C, D] (为每个类别生成一个调整量)
+        # 注意：这里通常需要根据 fmap 和 global_prototypes 共同生成
+        self.res_adapter = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1), # [B, D, 1, 1] -> [B, D]
+            nn.Flatten(),
+            nn.Linear(dim, dim // 4),
+            nn.ReLU(),
+            nn.Linear(dim // 4, num_classes * dim) # 生成 B * (C*D)
+        )
+        self.dim = dim
+        self.num_classes = num_classes
+
+    def forward(self, fmap, global_prototypes):
+        B, D, H, W = fmap.shape
+        
+        # --- 生成残差 ---
+        # 这里的实现比较简单，直接从图像全局特征生成所有类的残差
+        # 更高级的做法是用 Cross-Attention 生成
+        delta_p_flat = self.res_adapter(fmap) # [B, C*D]
+        delta_p = delta_p_flat.view(B, self.num_classes, D) # [B, C, D]
+        
+        # --- 叠加 ---
+        # global_prototypes: [C, D] -> [1, C, D]
+        p_global_expanded = global_prototypes.unsqueeze(0).expand(B, -1, -1)
+        
+        # Final P = Anchor + Delta
+        p_final = p_global_expanded + delta_p
+        
+        # --- 分割预测 (常规流程) ---
+        p_final_norm = F.normalize(p_final, dim=2)
+        fmap_norm = F.normalize(fmap.flatten(2), dim=1)
+        logits = torch.bmm(p_final_norm, fmap_norm).view(B, self.num_classes, H, W)
+        
+        return logits, delta_p , p_final 
+
 # ------------------------------
 # Network with controlled residual fusion
 # ------------------------------
@@ -219,6 +399,9 @@ class network(nn.Module):
             feat_dim=768,
             init='xavier'
         )       
+
+
+        self.res_model = ResidualPrototypeModel_cross(768)
         
         
 
@@ -246,6 +429,9 @@ class network(nn.Module):
             param_groups[2].append(classifier.weight)
         for prototype in self.prototype_module.prototype:
             param_groups[2].append(prototype)
+        
+        for param in list(self.res_model.parameters()):
+            param_groups[2].append(param)
 
         for param in list(self.decoder.parameters()):
             param_groups[3].append(param)
@@ -286,20 +472,22 @@ class network(nn.Module):
         P = self.prototype_module()   # [C_total, F]
 
         # cosine sim
-        x4_n = F.normalize(_x4, p=2, dim=1)
-        P_n  = F.normalize(P, p=2, dim=1)
-        P_n  = P_n.unsqueeze(-1).unsqueeze(-1)     # [C_total, F, 1, 1]
+        # x4_n = F.normalize(_x4, p=2, dim=1)
+        # P_n  = F.normalize(P, p=2, dim=1)
+        # P_n  = P_n.unsqueeze(-1).unsqueeze(-1)     # [C_total, F, 1, 1]
 
-        seg_proto = F.conv2d(x4_n, P_n)            # [B, C_total, H, W]
+        # seg_proto = F.conv2d(x4_n, P_n)            # [B, C_total, H, W]
+        seg_proto, delta_p ,p_final = self.res_model(_x4, P)
+
 
 
         if cam_grad:
             cam_grad_map = F.conv2d(_x4, self.classifier.get_weight())
-            return cam_grad_map, cls_x4, seg, _x4, cls_aux,seg_proto, P
+            return cam_grad_map, cls_x4, seg, _x4, cls_aux,seg_proto, P, delta_p, p_final
             
         
     
-        return cls_x4, seg, _x4, cls_aux,seg_proto, P
+        return cls_x4, seg, _x4, cls_aux,seg_proto, P, delta_p, p_final
 
 
 

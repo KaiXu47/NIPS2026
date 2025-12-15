@@ -134,7 +134,7 @@ class Trainer:
                 depth = F.interpolate(depth, size=[args.crop_size, args.crop_size], mode='bilinear',
                                        align_corners=False)
 
-                cls, segs, _, _, type_seg,_ = model(inputs, depth)
+                cls, segs, _, _, type_seg,_,_,_ = model(inputs, depth)
 
                 cls_pred = (cls > 0).type(torch.int16)
                 _f1 = evaluate.multilabel_score(cls_label.cpu().numpy()[0], cls_pred.cpu().numpy()[0])
@@ -287,7 +287,7 @@ class Trainer:
                 # cls_label , labels = remove_cow(cls_label, labels)
 
 
-                cls, segs, fmap, cls_aux, type_seg, P = model(
+                cls, segs, fmap, cls_aux, type_seg, P, delta_p, p_final = model(
                     inputs, depth,  # NEW
                 )
                 # 分割分支保持不变
@@ -300,7 +300,9 @@ class Trainer:
                 T = 0.1
                 type_seg = F.interpolate(type_seg, size=labels.shape[1:], mode='bilinear', align_corners=False)
                 proto_seg_loss = get_type_seg_loss(type_seg / T, labels.type(torch.long), ignore_index=args.ignore_index)
-                proto_sep_loss = prototype_sep_loss(P, cls_label,0)
+                
+                proto_sep_loss = compute_comprehensive_ortho_loss(P, p_final, delta_p, mode= 'final_only')
+
 
 
 
@@ -315,6 +317,7 @@ class Trainer:
                     'cls_loss': cls_loss,
                     'seg_loss': seg_loss,
                     'proto_seg_loss': proto_seg_loss,
+                    'proto_sep_loss': proto_sep_loss,
                 })
 
                 if (n_iter + 1) % args.log_iters == 0:
@@ -323,9 +326,9 @@ class Trainer:
                     # print(model.module.prototype_module())
                     if args.local_rank == 0:
                         logging.info(
-                            "Iter: %d; Elasped: %s; ETA: %s; LR: %.3e; cls_loss: %.4f ,seg_loss: %.4f, proto_seg_loss: %.4f..." % (
+                            "Iter: %d; Elasped: %s; ETA: %s; LR: %.3e; cls_loss: %.4f ,seg_loss: %.4f, proto_seg_loss: %.4f..., proto_sep_loss: %.4f..." % (
                                 n_iter + 1, delta, eta, cur_lr,
-                                avg_meter.pop('cls_loss'), avg_meter.pop('seg_loss'),avg_meter.pop('proto_seg_loss')
+                                avg_meter.pop('cls_loss'), avg_meter.pop('seg_loss'),avg_meter.pop('proto_seg_loss'),avg_meter.pop('proto_sep_loss'),
                             ))
 
                 if (n_iter + 1) % args.eval_iters == 0:
@@ -362,17 +365,17 @@ class Trainer:
 
                 cls_label = cls_label.to(device, non_blocking=True)
                 cls_label = cls_label[:, :self.total_classes]
-                old_cls, old_segs, _x4, old_cls_aux, type_seg_old, prototype_old = model_old(inputs, depth=depth)
-                cls_label_old_pred = (old_cls > 0).long()
+                old_cls, old_segs, _x4, old_cls_aux, type_seg_old, P_old, delta_p_old, p_final_old = model_old(inputs, depth=depth)
+                cls_label_old_pred = (old_cls > 2.0).long()
 
                 cls_label_gt_new = cls_label[:, -self.new_classes:]
                 cls_label = torch.cat((cls_label_old_pred, cls_label_gt_new), dim=1)
 
                 cams, cams_aux = multi_scale_cam2(model, inputs=inputs, depth=depth, scales=args.cam_scales)
 
-                cls, segs, fmap, cls_aux, type_seg_new, prototype_new = model(inputs, depth=depth)
+                cls, segs, fmap, cls_aux, type_seg_new, P_new, delta_p_new, p_final_new = model(inputs, depth=depth)
 
-                old_segs = F.interpolate(old_segs, size=[448, 448], mode='bilinear', align_corners=False)
+                old_segs = F.interpolate(type_seg_old, size=[448, 448], mode='bilinear', align_corners=False)
                 old_pixel_label = torch.argmax(old_segs, dim=1)
                 # old_pixel_label_filter = filter_old_dense_labels(old_pixel_label, cls_label = cls_label, ignore_index=args.ignore_index)
 
@@ -380,21 +383,13 @@ class Trainer:
                 cls_loss = F.multilabel_soft_margin_loss(cls, cls_label)
                 cls_loss_aux = F.multilabel_soft_margin_loss(cls_aux, cls_label)
 
-                #weight cls loss 
-                # class_weights = get_class_weight(cls_label, self.new_classes)
-                # cls_criterion = torch.nn.BCEWithLogitsLoss(pos_weight=class_weights)
-                # cls_loss = cls_criterion(cls, cls_label.float())
-                # cls_loss_aux = cls_criterion(cls_aux, cls_label.float())
-
 
 
                 valid_cam, _ = cam_to_label(cams.detach(), cls_label=cls_label, img_box=img_box, ignore_mid=True,
                                             bkg_thre=args.bkg_thre, high_thre=args.high_thre, low_thre=args.low_thre,
                                             ignore_index=args.ignore_index)
 
-                
-                new_cls_label = torch.zeros_like(cls_label).cuda()
-                new_cls_label[:, -self.new_classes:] = cls_label[:, -self.new_classes:]
+            
 
                 refined_pseudo_label = refine_cams_with_bkg_v2(par, inputs_denorm, cams=valid_cam, cls_labels=cls_label,
                                                                high_thre=args.high_thre, low_thre=args.low_thre,
@@ -419,39 +414,21 @@ class Trainer:
 
 
 
-                #prototype
-                # p_iter = masked_avg_pooling(fmap, gt_mask=refined_pseudo_label_new_cls, total_classes=self.total_classes)
-
-                # with torch.no_grad():
-                #     P_pool = model.module.prototype_module()   # (C, D)
-
-                # proto_sep_loss = prototype_separation_loss(
-                #     p_iter=p_iter,
-                #     P_pool=P_pool,
-                #     margin=0.1
-                # )
                 T = 0.1
                 type_seg_new = F.interpolate(type_seg_new, size=mixed_pseudo_label.shape[1:], mode='bilinear', align_corners=False)
                 proto_seg_loss = get_type_seg_loss(type_seg_new / T, mixed_pseudo_label.type(torch.long), ignore_index=args.ignore_index)
                 # print(proto_seg_loss)
                 
-                proto_kd_loss = prototype_kd_loss(prototype_new, prototype_old, cls_label, self.new_classes)
-                proto_sep_loss = prototype_sep_loss(prototype_new, cls_label, self.new_classes)
+                proto_kd_loss = prototype_kd_loss(P_new, P_old, cls_label, self.new_classes)
+                # proto_sep_loss = prototype_sep_loss(prototype_new, cls_label, self.new_classes)
+
+                proto_sep_loss = compute_comprehensive_ortho_loss(P_new, p_final_new, delta_p_new, mode= 'final_only')
+
                 # prototype_peak_loss = margin_triplet_peaky_loss(type_seg_new)
                 # print(prototype_peak_loss)
                 prototype_loss = 2 * proto_seg_loss + 1 * proto_kd_loss + 1 * proto_sep_loss
 
-                
-                
-                #visualize 
-                # type_seg_result = torch.argmax(type_seg_new, dim=1)
-                # segs_result = torch.argmax(segs, dim=1)
-                # visualize_dense_labels(refined_pseudo_label.detach(), segs_result.detach(), type_seg_result.detach() )
-                # img = inputs_denorm[0].cpu().numpy().transpose(1, 2, 0)  # CHW -> HWC
-               
-                # plt.imshow(img)
-                # plt.axis("off")
-                # plt.savefig("vis_input.png")
+            
 
                 # warmup
                 if n_iter <= 2000:

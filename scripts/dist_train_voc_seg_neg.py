@@ -126,7 +126,7 @@ if __name__ == "__main__":
         os.makedirs(args.ckpt_dir, exist_ok=True)
         os.makedirs(args.pred_dir, exist_ok=True)
         if os.path.exists(os.path.join(args.work_dir, 'train.log')):
-            print('ICME')
+            print('ICME res')
             print('train_log already exist, check work_dir! ')
             setup_logger(filename=os.path.join(args.work_dir,  timestamp + 'train.log'))
             
