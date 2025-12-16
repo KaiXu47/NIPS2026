@@ -422,7 +422,7 @@ class Trainer:
                 proto_kd_loss = prototype_kd_loss(P_new, P_old, cls_label, self.new_classes)
                 # proto_sep_loss = prototype_sep_loss(prototype_new, cls_label, self.new_classes)
 
-                proto_sep_loss = compute_comprehensive_ortho_loss(P_new, p_final_new, delta_p_new, mode= 'final_only')
+                proto_sep_loss = compute_comprehensive_ortho_loss(P_new, p_final_new, delta_p_new, mode= 'cross')
 
                 # prototype_peak_loss = margin_triplet_peaky_loss(type_seg_new)
                 # print(prototype_peak_loss)
@@ -434,7 +434,7 @@ class Trainer:
                 if n_iter <= 2000:
                     loss = 1.0 * cls_loss + 1.0 * cls_loss_aux + args.w_ptc * ptc_loss + 0.0 * seg_loss 
                 else:
-                    loss = 1.0 * cls_loss + 1.0 * cls_loss_aux + args.w_ptc * ptc_loss + args.w_seg * seg_loss + 0.1* prototype_loss
+                    loss = 1.0 * cls_loss + 1.0 * cls_loss_aux + args.w_ptc * ptc_loss + 0.0 * seg_loss + 0.1* prototype_loss
 
                 if n_iter % 2000 == 0 and n_iter != 0:
                     if args.local_rank == 0:  # save model at the eval iteration

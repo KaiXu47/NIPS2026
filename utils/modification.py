@@ -396,29 +396,19 @@ def compute_comprehensive_ortho_loss(
     p_global_n = F.normalize(p_global, dim=-1)     # [C, D]
     p_final_n = F.normalize(p_final, dim=-1)       # [B, C, D]
 
-    # ----------------------------------------------------------------
-    # 策略 A: 监督 P_Global (传统的静态约束)
-    # 保证初始锚点是分开的
-    # ----------------------------------------------------------------
     if mode == 'global_only' or mode == 'all':
         # [C, D] @ [D, C] -> [C, C]
         sim_g = torch.mm(p_global_n, p_global_n.t())
-        # 只惩罚非对角线
+
         mask = 1.0 - torch.eye(C, device=p_global.device)
         loss_ortho += (sim_g * mask).pow(2).mean()
-    # ----------------------------------------------------------------
-    # 策略 B: 监督 P_Final (强约束)
-    # 保证最终用于分类的特征是分开的
-    # ----------------------------------------------------------------
+
     if mode == 'final_only':
         # [B, C, D] @ [B, D, C] -> [B, C, C]
         sim_f = torch.bmm(p_final_n, p_final_n.transpose(1, 2))
         mask = 1.0 - torch.eye(C, device=p_global.device).unsqueeze(0)
         loss_ortho += (sim_f * mask).pow(2).mean()
-    # ----------------------------------------------------------------
-    # 策略 C: 交叉监督 (Cross-Constraint) - 【推荐用于增量学习】
-    # 含义：第 i 类的 Instance (P_final) 不能像 第 j 类的 Anchor (P_global)
-    # ----------------------------------------------------------------
+
     if mode == 'cross' or mode == 'all':
         # p_final_n: [B, C, D]
         # p_global_n: [C, D] -> [1, D, C] (transpose & expand)
@@ -427,15 +417,10 @@ def compute_comprehensive_ortho_loss(
         # result[b, i, j] = P_final_i * P_global_j
         sim_cross = torch.matmul(p_final_n, p_global_n.t())
         
-        # 我们只惩罚 i != j 的情况
-        # 即：我的最终特征，可以像我的全局原型（对角线），但不能像别人的全局原型
         mask = 1.0 - torch.eye(C, device=p_global.device).unsqueeze(0)
         
         loss_ortho += (sim_cross * mask).pow(2).mean()
 
-    # ----------------------------------------------------------------
-    # 额外：Delta P 的正则化 (防止飘太远)
-    # ----------------------------------------------------------------
     loss_reg = torch.mean(torch.norm(delta_p, p=2, dim=-1))
 
     return loss_ortho+ 0.5 * loss_reg

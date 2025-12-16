@@ -338,10 +338,6 @@ class ResidualPrototypeModel_v1(nn.Module):
 
     def forward(self, fmap, global_prototypes):
         B, D, H, W = fmap.shape
-        
-        # --- 生成残差 ---
-        # 这里的实现比较简单，直接从图像全局特征生成所有类的残差
-        # 更高级的做法是用 Cross-Attention 生成
         delta_p_flat = self.res_adapter(fmap) # [B, C*D]
         delta_p = delta_p_flat.view(B, self.num_classes, D) # [B, C, D]
         
