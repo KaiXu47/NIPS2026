@@ -102,6 +102,184 @@ class Mlp(nn.Module):
         return x
 
 
+class IndependentCMSMLP(nn.Module):
+    """
+    Independent Continuum Memory System (CMS) MLP.
+    采用并联架构，包含 slow_block (长期记忆), mid_block (中期记忆), fast_block (工作记忆/新知识)。
+    均值聚合：保证在三者权重相同时，输出分布与单一 MLP 完全一致。
+    """
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
+        super().__init__()
+        # 三个并联的子模块，代表不同的更新频率记忆
+        self.slow_block = Mlp(in_features, hidden_features, out_features, act_layer, drop)
+        self.mid_block = Mlp(in_features, hidden_features, out_features, act_layer, drop)
+        self.fast_block = Mlp(in_features, hidden_features, out_features, act_layer, drop)
+
+    def forward(self, x):
+        # 并联处理同一个输入
+        out_slow = self.slow_block(x)
+        out_mid = self.mid_block(x)
+        out_fast = self.fast_block(x)
+        
+        # 均值聚合：保证初期三者权重相同时，输出分布与单一 MLP 完全一致
+        # 方案 A：先除以 3 再相加，彻底避免加法溢出 (推荐，最省显存)
+        return (out_slow / 3.0) + (out_mid / 3.0) + (out_fast / 3.0)
+
+
+def load_base_mlp_to_cms(cms_mlp: IndependentCMSMLP, base_mlp_state_dict: dict):
+    """
+    将 Step 0 (Base) 训练好的普通 Mlp 权重，精确复制到 IndependentCMSMLP 的三个子模块中。
+    这样由于后续是均值聚合，初始状态下的输出将与 base_mlp 完全一致。
+    """
+    cms_mlp.slow_block.load_state_dict(base_mlp_state_dict)
+    cms_mlp.mid_block.load_state_dict(base_mlp_state_dict)
+    cms_mlp.fast_block.load_state_dict(base_mlp_state_dict)
+
+
+def get_cms_param_groups(model: nn.Module, base_lr: float, decay_rate: float = 0.9, depth: int = 12):
+    """
+    复合学习率分配逻辑 (LLRD + CMS)：
+    - layer_decay: 逐层衰减，浅层小，深层接近 1.0
+    - IndependentCMSMLP 内部：
+        - fast_block: lr = base_lr * layer_decay * 1.0
+        - mid_block: lr = base_lr * layer_decay * 0.1
+        - slow_block: lr = base_lr * layer_decay * 0.01 (不再冻结)
+    - 其他参数: lr = base_lr * layer_decay
+    """
+    param_groups = []
+    assigned_params = set()
+
+    # 1. 遍历所有参数并分配 LR
+    for name, param in model.named_parameters():
+        if not param.requires_grad or id(param) in assigned_params:
+            continue
+
+        # 确定逻辑层级索引 (logical layer index)
+        # 0: Embedding/Patch, 1-N: Transformer Blocks, N+1: Final Norm/Heads
+        if any(x in name for x in ["patch_embed", "pos_embed", "cls_token"]):
+            layer_idx = 0
+        elif "blocks." in name:
+            layer_idx = int(name.split("blocks.")[1].split(".")[0]) + 1
+        else:
+            layer_idx = depth + 1
+        
+        # 基础层级衰减 (LLRD)
+        # 层级越高 (靠近输出), 衰减越少, 越接近 1.0
+        layer_scale = decay_rate ** (depth + 1 - layer_idx)
+        current_lr = base_lr * layer_scale
+
+        # 针对 IndependentCMSMLP 的子模块进行频率衰减 (增量阶段使用)
+        if "mlp.slow_block" in name:
+            current_lr *= 0.01
+        elif "mlp.mid_block" in name:
+            current_lr *= 0.1
+        # 标准 MLP 或 mlp.fast_block 保持当前的当前层级学习率 (即 1.0x 倍率)
+
+        param_groups.append({
+            'params': [param],
+            'lr': current_lr
+        })
+        assigned_params.add(id(param))
+
+    return param_groups
+
+
+import torch
+import torch.nn as nn
+
+def replace_mlp_with_cms(model: nn.Module, step=1):
+    """
+    功能 1：纯粹的结构替换 (在模型初始化后、加载 Checkpoint 前调用)
+    
+    不管 step 是 1 还是更大，只要进入增量阶段，
+    我们就只管把 Mlp 的“壳子”换成 IndependentCMSMLP 的“壳子”。
+    内部的随机权重不用管，外部的 load_state_dict 和字典转换器会负责填充正确的权重。
+    """
+    if step < 1:
+        return model  # Step 0 保持普通的 Mlp 原样
+
+    for name, module in model.named_modules():
+        if hasattr(module, 'mlp'):
+            if isinstance(module.mlp, Mlp):
+                # 1. 提取原有的 Mlp 维度参数
+                in_features = module.mlp.fc1.in_features
+                hidden_features = module.mlp.fc1.out_features
+                out_features = module.mlp.fc2.out_features
+                drop = module.mlp.drop.p
+                
+                # 2. 实例化全新的并联 CMS_MLP (此时内部全是随机权重)
+                cms_mlp = IndependentCMSMLP(
+                    in_features=in_features, 
+                    hidden_features=hidden_features, 
+                    out_features=out_features, 
+                    drop=drop
+                )
+                
+                # 3. 迁移到原 MLP 所在的设备并进行物理替换
+                device = next(module.mlp.parameters()).device
+                cms_mlp = cms_mlp.to(device)
+                module.mlp = cms_mlp
+
+    return model
+
+def sync_cms_weights(model: nn.Module, sync_mode: str = 'slow'):
+    """
+    针对 step > 1，在外部加载完 Checkpoint 后调用的记忆同步函数。
+    
+    参数 sync_mode 控制同步策略：
+    - 'none': 各复制各的 (不做任何同步，保持加载进来的原有状态)
+    - 'slow': 都复制最慢的 (用 slow_block 覆盖 mid_block 和 fast_block)
+    - 'fast': 都复制最快的 (用 fast_block 覆盖 slow_block 和 mid_block)
+    """
+    # 1. 模式一：各复制各的 (因为外部已经 load_state_dict 了，所以直接 return 即可)
+    if sync_mode == 'none':
+        print("==> [Sync] Mode 'none': 各分支保持独立，不同步。")
+        return model
+
+    # 执行同步操作
+    for name, module in model.named_modules():
+        if hasattr(module, 'mlp') and isinstance(module.mlp, IndependentCMSMLP):
+            
+            # 2. 模式二：都复制最慢的 (记忆重置)
+            if sync_mode == 'slow':
+                slow_state = module.mlp.slow_block.state_dict()
+                module.mlp.mid_block.load_state_dict(slow_state)
+                module.mlp.fast_block.load_state_dict(slow_state)
+                
+            # 3. 模式三：都复制最快的 (记忆提交/巩固)
+            elif sync_mode == 'fast':
+                fast_state = module.mlp.fast_block.state_dict()
+                module.mlp.slow_block.load_state_dict(fast_state)
+                module.mlp.mid_block.load_state_dict(fast_state)
+                
+            else:
+                raise ValueError(f"不支持的同步模式: {sync_mode}。请选择 'none', 'slow', 或 'fast'。")
+                
+    print(f"==> [Sync] Mode '{sync_mode}': 权重同步完成！")
+    return model
+
+def remap_cms_state_dict(state_dict, step):
+    """
+    纯粹的字典键值转换器，不涉及任何模型加载逻辑。
+    在 torch.load 之后，model.load_state_dict 之前调用。
+    """
+    # 如果是 step > 1，字典的 key 已经自带 slow/mid/fast 了，原样返回即可
+    if step > 1:
+        return state_dict
+
+    # 如果是 step == 1，将普通的 mlp 键值一分为三
+    print("==> [Step 1] Remapping Base 'mlp' keys to 'slow/mid/fast'...")
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        if '.mlp.' in k:
+            new_state_dict[k.replace('.mlp.', '.mlp.slow_block.')] = v
+            new_state_dict[k.replace('.mlp.', '.mlp.mid_block.')] = v
+            new_state_dict[k.replace('.mlp.', '.mlp.fast_block.')] = v
+        else:
+            new_state_dict[k] = v
+            
+    return new_state_dict
+
 class Attention(nn.Module):
     def __init__(self, dim, num_heads=8, qkv_bias=False, qk_scale=None, attn_drop=0., proj_drop=0., vis=False):
         super().__init__()
@@ -171,7 +349,7 @@ class PatchEmbed(nn.Module):
         self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
 
 
-    def forward(self, x, depth):
+    def forward(self, x):
 
         B, C, H, W = x.shape
         x = self.proj(x)  # [B, C, H', W']
@@ -231,7 +409,7 @@ class VisionTransformer(nn.Module):
         if hybrid_backbone is not None:
             self.patch_embed = HybridEmbed(hybrid_backbone, img_size=img_size, in_chans=in_chans, embed_dim=embed_dim)
         else:
-            self.patch_embed = PatchEmbed(in_chans=in_chans, embed_dim=embed_dim)
+            self.patch_embed = PatchEmbed(img_size=img_size, patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
 
         self.num_patches = self.patch_embed.num_patches
 
@@ -279,10 +457,10 @@ class VisionTransformer(nn.Module):
         self.num_classes = num_classes
         self.head = nn.Linear(self.embed_dim, num_classes) if num_classes > 0 else nn.Identity()
 
-    def prepare_tokens(self, x, depth):
+    def prepare_tokens(self, x):
         B, nc, h, w = x.shape
         h, w = h // self.patch_embed.patch_size[0], w // self.patch_embed.patch_size[1]
-        x = self.patch_embed(x, depth)  # patch linear embedding
+        x = self.patch_embed(x)  # patch linear embedding
 
         patch_pos_embed = self.pos_embed[:, 1:, :].reshape(1, self._size, self._size, -1).permute(0, 3, 1, 2)
         patch_pos_embed = F.interpolate(patch_pos_embed, size=(h, w), mode="bicubic", align_corners=False)
@@ -298,8 +476,8 @@ class VisionTransformer(nn.Module):
 
         return x
 
-    def forward_features(self, x, depth):
-        x = self.prepare_tokens(x, depth)
+    def forward_features(self, x):
+        x = self.prepare_tokens(x)
         x = self.pos_drop(x)
         embeds = []
         for i, blk in enumerate(self.blocks):
@@ -375,57 +553,102 @@ def vit_base_patch16_224(pretrained=False, in_chans=3, **kwargs):
 
 
 @register_model
-def vit_base_patch16_384(pretrained=False, **kwargs):
+def vit_base_patch16_384(pretrained=False, in_chans=3, **kwargs):
     model = VisionTransformer(
         img_size=384, patch_size=16, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), 
+        in_chans=in_chans,
+        **kwargs)
     model.default_cfg = default_cfgs['vit_base_patch16_384']
     if pretrained:
-        load_pretrained(model, num_classes=model.num_classes, in_chans=kwargs.get('in_chans', 3))
+        load_pretrained(
+            model,
+            pretrained_cfg=model.default_cfg,
+            num_classes=model.num_classes, 
+            in_chans=in_chans,
+            filter_fn=_conv_filter,
+            strict=False
+        )
     return model
 
 
 @register_model
-def vit_base_patch32_384(pretrained=False, **kwargs):
+def vit_base_patch32_384(pretrained=False, in_chans=3, **kwargs):
     model = VisionTransformer(
         img_size=384, patch_size=32, embed_dim=768, depth=12, num_heads=12, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), 
+        in_chans=in_chans,
+        **kwargs)
     model.default_cfg = default_cfgs['vit_base_patch32_384']
     if pretrained:
-        load_pretrained(model, num_classes=model.num_classes, in_chans=kwargs.get('in_chans', 3))
+        load_pretrained(
+            model,
+            pretrained_cfg=model.default_cfg,
+            num_classes=model.num_classes, 
+            in_chans=in_chans,
+            filter_fn=_conv_filter,
+            strict=False
+        )
     return model
 
 
 @register_model
-def vit_large_patch16_224(pretrained=False, **kwargs):
+def vit_large_patch16_224(pretrained=False, in_chans=3, **kwargs):
     model = VisionTransformer(
         patch_size=16, embed_dim=1024, depth=24, num_heads=16, mlp_ratio=4, qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), 
+        in_chans=in_chans,
+        **kwargs)
     model.default_cfg = default_cfgs['vit_large_patch16_224']
     if pretrained:
-        load_pretrained(model, num_classes=model.num_classes, in_chans=kwargs.get('in_chans', 3))
+        load_pretrained(
+            model,
+            pretrained_cfg=model.default_cfg,
+            num_classes=model.num_classes, 
+            in_chans=in_chans,
+            filter_fn=_conv_filter,
+            strict=False
+        )
     return model
 
 
 @register_model
-def vit_large_patch16_384(pretrained=False, **kwargs):
+def vit_large_patch16_384(pretrained=False, in_chans=3, **kwargs):
     model = VisionTransformer(
         img_size=384, patch_size=16, embed_dim=1024, depth=24, num_heads=16, mlp_ratio=4,  qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), 
+        in_chans=in_chans,
+        **kwargs)
     model.default_cfg = default_cfgs['vit_large_patch16_384']
     if pretrained:
-        load_pretrained(model, num_classes=model.num_classes, in_chans=kwargs.get('in_chans', 3))
+        load_pretrained(
+            model,
+            pretrained_cfg=model.default_cfg,
+            num_classes=model.num_classes, 
+            in_chans=in_chans,
+            filter_fn=_conv_filter,
+            strict=False
+        )
     return model
 
 
 @register_model
-def vit_large_patch32_384(pretrained=False, **kwargs):
+def vit_large_patch32_384(pretrained=False, in_chans=3, **kwargs):
     model = VisionTransformer(
         img_size=384, patch_size=32, embed_dim=1024, depth=24, num_heads=16, mlp_ratio=4,  qkv_bias=True,
-        norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
+        norm_layer=partial(nn.LayerNorm, eps=1e-6), 
+        in_chans=in_chans,
+        **kwargs)
     model.default_cfg = default_cfgs['vit_large_patch32_384']
     if pretrained:
-        load_pretrained(model, num_classes=model.num_classes, in_chans=kwargs.get('in_chans', 3))
+        load_pretrained(
+            model,
+            pretrained_cfg=model.default_cfg,
+            num_classes=model.num_classes, 
+            in_chans=in_chans,
+            filter_fn=_conv_filter,
+            strict=False
+        )
     return model
 
 

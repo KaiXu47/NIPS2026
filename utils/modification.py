@@ -208,47 +208,97 @@ def prototype_separation_loss(p_iter, P_pool, margin=0.3):
     return loss / (cnt+1e-6)
 
 
-def get_type_seg_loss(logits, target, ignore_index=255):
+def get_type_seg_loss(logits, target, ignore_index=255, keep_ratio=1.0):
     """
-    logits: [B, C, H, W]  (proto_seg logits)
-    target: [B, H, W]     (long tensor)
-    ignore_index: int
+    带 OHEM (Online Hard Example Mining) 的交叉熵损失。
+    keep_ratio=1.0 时退化为标准 Cross Entropy。
     """
-    B, C, H, W = logits.shape
+    if logits.shape[-2:] != target.shape[-2:]:
+        logits = F.interpolate(
+            logits, 
+            size=target.shape[-2:], 
+            mode='bilinear', 
+            align_corners=False
+        )
     
-    # Flatten
-    logits_flat = logits.permute(0, 2, 3, 1).reshape(-1, C)    # [B*H*W, C]
-    target_flat = target.view(-1)                              # [B*H*W]
+    # 1. 计算每个像素的 Cross Entropy (reduction='none' 保持像素独立)
+    ce_loss = F.cross_entropy(logits, target.long(), ignore_index=ignore_index, reduction='none')
+    
+    # 2. 扁平化以便排序
+    ce_loss = ce_loss.view(-1)
+    
+    # 3. 过滤掉 ignore 区域 (ce_loss 默认为 0，但为了严谨我们显式过滤)
+    valid_mask = ce_loss > 0
+    ce_loss = ce_loss[valid_mask]
+    
+    if ce_loss.numel() == 0:
+        return torch.tensor(0.0, device=logits.device, requires_grad=True)
+    
+    # 4. 执行 OHEM 排序与筛选
+    # 计算需要保留的难样本数量
+    num_keep = int(keep_ratio * ce_loss.numel())
+    if num_keep < ce_loss.numel():
+        # 找到前 num_keep 个最大的 loss 值
+        vals, _ = torch.topk(ce_loss, num_keep)
+        return vals.mean()
+    
+    return ce_loss.mean()
 
-    # Build mask
-    mask = (target_flat != ignore_index)                       # [B*H*W]
+def get_dice_loss(logits, target, ignore_index=255, smooth=1.0):
+    """
+    多类别 Dice Loss，对类别不均衡更鲁棒。
+    """
+    if logits.shape[-2:] != target.shape[-2:]:
+        logits = F.interpolate(logits, size=target.shape[-2:], mode='bilinear', align_corners=False)
+    
+    B, C, H, W = logits.shape
+    probs = F.softmax(logits, dim=1)
+    
+    # 1. 有效区域 Mask
+    valid_mask = (target != ignore_index)
+    
+    # 2. 安全构建 One-Hot
+    # 防止 target 中的 ignore_index (如 255) 导致 one_hot 越界崩溃
+    target_safe = torch.clamp(target, 0, C - 1).long()
+    target_one_hot = F.one_hot(target_safe, num_classes=C).permute(0, 3, 1, 2).float()
+    
+    # 3. 过滤掉 ignore_index 区域的影响
+    valid_mask_float = valid_mask.unsqueeze(1).float()
+    probs = probs * valid_mask_float
+    target_one_hot = target_one_hot * valid_mask_float
+    
+    # 4. 计算 Intersection 和 Cardinality (在 B, H, W 维度上求和)
+    dims = (0, 2, 3) 
+    intersection = torch.sum(probs * target_one_hot, dim=dims)
+    cardinality = torch.sum(probs + target_one_hot, dim=dims)
+    
+    # 5. Dice Score & Loss
+    dice_score = (2.0 * intersection + smooth) / (cardinality + smooth)
+    dice_loss = 1.0 - dice_score
+    
+    # 6. 动态平均：只计算当前 batch 中真实存在的类别
+    # 避免图片中根本没有的类别产生 1.0 的满额 loss 干扰训练
+    present_mask = (target_one_hot.sum(dim=dims) > 0)
+    
+    if present_mask.sum() > 0:
+        return dice_loss[present_mask].mean()
+        
+    return dice_loss.mean()
 
-    if mask.sum() == 0:
-        # 全部都是 ignore，避免 NaN
-        return torch.zeros((), device=logits.device, dtype=logits.dtype)
-
-    # Select valid locations
-    logits_valid = logits_flat[mask]
-    target_valid = target_flat[mask]
-
-    # Standard CE loss
-    loss = F.cross_entropy(logits_valid, target_valid)
-
-    return loss
-
-
-def prototype_kd_loss(p_new, p_old, num_new_cls, lambda_dir=1.0, lambda_struct=1.0):
+def prototype_kd_loss(p_new, p_old, lambda_dir=1.0, lambda_struct=1.0, skip_bg=True):
     """
     p_old: [C, D] old model prototypes（teacher）
     p_new: [C, D] new model prototypes（student）
-    num_new_cls: 新增类别数（旧类为前 C - num_new_cls）
     """
-    # ---- 1. 只取旧类 ----
     C = p_old.size(0)
     old_C = C
     
-    p_old = p_old[1:old_C]
-    p_new = p_new[1:old_C]
+    if skip_bg:
+        p_old = p_old[1:old_C]
+        p_new = p_new[1:old_C]
+    else:
+        p_old = p_old[:old_C]
+        p_new = p_new[:old_C]
 
     # print(p_old.shape)
     # print(p_new.shape)
@@ -281,9 +331,12 @@ def prototype_kd_loss(p_new, p_old, num_new_cls, lambda_dir=1.0, lambda_struct=1
 
     return loss
  
-def prototype_sep_loss(p_new_raw, cls_label , num_new_cls = 0):
+def prototype_sep_loss(p_new_raw, cls_label , num_new_cls = 0, skip_bg=True):
     
-    p_new = p_new_raw[1:]
+    if skip_bg:
+        p_new = p_new_raw[1:]
+    else:
+        p_new = p_new_raw
     device = p_new.device
     C, D = p_new.size()
 
@@ -377,50 +430,71 @@ def margin_triplet_peaky_loss(type_seg_logits, margin=0.3):
     return loss.mean()
 
 
+def compute_dynamic_margin_ortho_loss(p_current, clip_sim_matrix, max_margin=0.6):
+    """
+    带上限的动态 Margin 正交损失：
+    p_current: [C, D] 当前模型的 Prototype
+    clip_sim_matrix: [C, C] 离线的 CLIP 相似度矩阵
+    max_margin: 容忍度的上限。即使 CLIP 相似度是 0.8，Margin 也只给到 0.4，确保必须有 0.6 的区分度。
+    """
+    C = p_current.size(0)
+    p_n = F.normalize(p_current, dim=-1)
+    # 1. 计算当前 Prototype 间的相似度
+    sim_matrix = torch.mm(p_n, p_n.t()) # [C, C]
+    
+    # 2. 计算动态 Margin：取 CLIP 相似度和上限的最小值
+    # clip_sim_matrix 应预先对齐到当前类别数
+    dynamic_margin = torch.clamp(clip_sim_matrix, max=max_margin)
+    
+    # 3. 只有当 当前相似度 > 动态允许的相似度(Margin) 时，才产生惩罚
+    loss = torch.pow(F.relu(sim_matrix - dynamic_margin), 2)
+    
+    # 排除对角线（类自身）
+    mask = 1.0 - torch.eye(C, device=p_current.device)
+    return (loss * mask).sum() / (mask.sum() + 1e-6)
+
+
 def compute_comprehensive_ortho_loss(
     p_global, 
     p_final, 
     delta_p, 
-    mode='cross'  # 可选 'global_only', 'final_only', 'cross'
+    mode='all',
+    margin=0.2 
 ):
     """
-    p_global: [C, D]  (所有类别的全局原型)
-    p_final:  [B, C, D] (加上残差后的原型)
-    delta_p:  [B, C, D] (残差部分，用于正则化)
+    Soft-margin Orthogonality Loss:
+    允许类别之间存在一定的余弦相似度 (小于 margin 时 loss 为 0)。
+    这样可以保留类别之间的语义共性，只压制过高的冗余。
     """
     B, C, D = p_final.shape
-    
     loss_ortho = 0.0
 
     # 1. 基础归一化
     p_global_n = F.normalize(p_global, dim=-1)     # [C, D]
     p_final_n = F.normalize(p_final, dim=-1)       # [B, C, D]
 
+    # 为了避免对角线（类自身）的干扰，创建一个 mask
+    mask = (1.0 - torch.eye(C, device=p_global.device)) # [C, C]
+
     if mode == 'global_only' or mode == 'all':
-        # [C, D] @ [D, C] -> [C, C]
-        sim_g = torch.mm(p_global_n, p_global_n.t())
-
-        mask = 1.0 - torch.eye(C, device=p_global.device)
-        loss_ortho += (sim_g * mask).pow(2).mean()
-
-    if mode == 'final_only':
-        # [B, C, D] @ [B, D, C] -> [B, C, C]
-        sim_f = torch.bmm(p_final_n, p_final_n.transpose(1, 2))
-        mask = 1.0 - torch.eye(C, device=p_global.device).unsqueeze(0)
-        loss_ortho += (sim_f * mask).pow(2).mean()
+        # 全局原型之间的相似度矩阵
+        sim_g = torch.mm(p_global_n, p_global_n.t()) # [C, C]
+        
+        # 软间隔控制：只有当相似度 > margin 时才产生惩罚
+        # 使用 pow(2) 增加大偏差的惩罚力度
+        loss_g = torch.pow(F.relu(sim_g * mask - margin), 2).mean()
+        loss_ortho += loss_g
 
     if mode == 'cross' or mode == 'all':
-        # p_final_n: [B, C, D]
-        # p_global_n: [C, D] -> [1, D, C] (transpose & expand)
+        # p_final_n: [B, C, D], p_global_n: [C, D]
+        # 计算当前 instance 原型与全局原型的交叉相似度
+        sim_cross = torch.matmul(p_final_n, p_global_n.t()) # [B, C, C]
         
-        # [B, C, D] @ [1, D, C] -> [B, C, C]
-        # result[b, i, j] = P_final_i * P_global_j
-        sim_cross = torch.matmul(p_final_n, p_global_n.t())
-        
-        mask = 1.0 - torch.eye(C, device=p_global.device).unsqueeze(0)
-        
-        loss_ortho += (sim_cross * mask).pow(2).mean()
+        mask_cross = mask.unsqueeze(0) # [1, C, C]
+        loss_c = torch.pow(F.relu(sim_cross * mask_cross - margin), 2).mean()
+        loss_ortho += loss_c
 
+    # 残差项的范数正则（如果你现在用了 SimpleHead，delta_p 是 0，这项会自动失效）
     loss_reg = torch.mean(torch.norm(delta_p, p=2, dim=-1))
 
-    return loss_ortho+ 0.5 * loss_reg
+    return loss_ortho + 0.1 * loss_reg

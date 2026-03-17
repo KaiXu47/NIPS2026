@@ -301,3 +301,134 @@ def filter_cam_pesudo_label(cam_label, cam_filter_class, ignore_idx=255):
         cam_label_filtered[i][~keep_mask] = ignore_idx
 
     return cam_label_filtered
+
+def get_mixed_label_with_sam(cam_label, old_segs_label, sam_mask, total_classes, new_classes, ignore_index=255):
+    """
+    [魔改版 - 兼容 total_classes=15]
+    即使你传入 total_classes=15 (最大ID)，这个版本也会自动在内部 +1，
+    从而支持 <= total_classes 的判定，解决 Person mIoU=0 的问题。
+    """
+    b, h, w = cam_label.shape
+    device = cam_label.device
+
+    # ============================================================
+    # 1. [关键修改] 自动修正总类别数
+    # 如果你习惯传 15 (MaxID)，这里我们强制 +1 变成 16 (Count)，用于申请显存
+    # ============================================================
+    real_total_classes = total_classes + 1  # 内部使用 16
+
+    # 重新计算分界线：16 - 5 = 11. (索引 0-10 是旧, 11-15 是新)
+    cam_old_classes = real_total_classes - new_classes
+
+    SAM_TRUST_THRESH = 0.6
+
+    final_label = old_segs_label.clone().to(device)
+    sam_mask = sam_mask.to(device)
+
+    # 构建网格
+    y_grid, x_grid = torch.meshgrid(torch.arange(h, device=device), torch.arange(w, device=device), indexing='ij')
+    y_grid = y_grid.unsqueeze(0).expand(b, -1, -1).float()
+    x_grid = x_grid.unsqueeze(0).expand(b, -1, -1).float()
+
+    for i in range(b):
+        curr_sam = sam_mask[i]
+        curr_cam = cam_label[i]
+        curr_old = old_segs_label[i]
+        flat_sam = curr_sam.view(-1)
+
+        valid_pixel_mask = (flat_sam != -1)
+        if not valid_pixel_mask.any(): continue
+
+        active_sam = flat_sam[valid_pixel_mask]
+        active_y = y_grid[i].view(-1)[valid_pixel_mask]
+        active_x = x_grid[i].view(-1)[valid_pixel_mask]
+
+        num_regions = int(active_sam.max().item()) + 1
+
+        # --- 计算中心和权重 (保持不变) ---
+        region_counts = torch.zeros(num_regions, device=device)
+        region_counts.scatter_add_(0, active_sam, torch.ones_like(active_sam, dtype=torch.float))
+        region_counts = region_counts.clamp(min=1e-5)
+
+        sum_y = torch.zeros(num_regions, device=device)
+        sum_x = torch.zeros(num_regions, device=device)
+        sum_y.scatter_add_(0, active_sam, active_y)
+        sum_x.scatter_add_(0, active_sam, active_x)
+
+        cent_y = sum_y / region_counts
+        cent_x = sum_x / region_counts
+
+        radius_proxy = torch.sqrt(region_counts) / 2.0
+        sigma = torch.max(radius_proxy, torch.tensor(1.0, device=device))
+
+        pixel_cy = cent_y[active_sam]
+        pixel_cx = cent_x[active_sam]
+        pixel_sigma = sigma[active_sam]
+        dist_sq = (active_y - pixel_cy) ** 2 + (active_x - pixel_cx) ** 2
+        weights = torch.exp(-dist_sq / (2 * pixel_sigma ** 2 + 1e-5))
+
+        # --- 仲裁逻辑 ---
+        active_cam = curr_cam.view(-1)[valid_pixel_mask]
+
+        # 注意：这里逻辑基于 cam_old_classes (11)
+        # ID 11 >= 11 (True, 新类)
+        is_new_class_pixel = (active_cam >= cam_old_classes) & (active_cam != ignore_index)
+
+        sum_weights = torch.zeros(num_regions, device=device)
+        sum_weights.scatter_add_(0, active_sam, weights)
+        weighted_new_score = torch.zeros(num_regions, device=device)
+        weighted_new_score.scatter_add_(0, active_sam, weights * is_new_class_pixel.float())
+        ratios = weighted_new_score / (sum_weights + 1e-5)
+        region_decision_is_new = (ratios > SAM_TRUST_THRESH)
+
+        # --- 投票逻辑 ---
+        pixel_decision_is_new = region_decision_is_new[active_sam]
+        active_old = curr_old.view(-1)[valid_pixel_mask]
+
+        vote_labels = torch.full_like(active_sam, -1, dtype=torch.long)
+
+        mask_branch_new = pixel_decision_is_new & is_new_class_pixel
+        vote_labels[mask_branch_new] = active_cam[mask_branch_new].long()
+
+        mask_branch_old = (~pixel_decision_is_new) & (active_old != ignore_index)
+        vote_labels[mask_branch_old] = active_old[mask_branch_old].long()
+
+        # ============================================================
+        # 2. [关键修改] 这里的判断逻辑改成 <=
+        # 因为我们内部扩容了，所以 index=15 是安全的
+        # total_classes (15) < real_total_classes (16)
+        # ============================================================
+        valid_votes_mask = (vote_labels != -1) & (vote_labels <= total_classes) & (vote_labels >= 0)
+
+        if not valid_votes_mask.any(): continue
+
+        final_vote_regions = active_sam[valid_votes_mask]
+        final_vote_classes = vote_labels[valid_votes_mask]
+        final_vote_weights = weights[valid_votes_mask]
+
+        # ============================================================
+        # 3. [关键修改] 展平索引必须乘 real_total_classes (16)
+        # 否则数据会错位，把 Region A 的 Person 票投给 Region B 的背景
+        # ============================================================
+        flat_vote_indices = final_vote_regions * real_total_classes + final_vote_classes
+
+        # 申请显存也要用 real_total_classes
+        vote_bins = torch.zeros(num_regions * real_total_classes, device=device)
+        vote_bins.scatter_add_(0, flat_vote_indices, final_vote_weights)
+
+        # reshape 也要用 real_total_classes
+        winner_classes = torch.argmax(vote_bins.view(num_regions, real_total_classes), dim=1)
+
+        region_has_votes = (vote_bins.view(num_regions, real_total_classes).sum(dim=1) > 0)
+
+        # --- 赋值 ---
+        pixel_winners = winner_classes[active_sam]
+        pixel_valid_update = region_has_votes[active_sam]
+
+        curr_final_flat = final_label[i].view(-1)
+        original_vals = curr_final_flat[valid_pixel_mask]
+        new_vals = torch.where(pixel_valid_update, pixel_winners.long(), original_vals)
+        curr_final_flat[valid_pixel_mask] = new_vals
+        final_label[i] = curr_final_flat.view(h, w)
+
+    return final_label

@@ -27,7 +27,7 @@ parser.add_argument("--alpha", default=0.5, type=float, help="alpha")
 parser.add_argument("--pooling", default="gmp", type=str, help="pooling method")
 parser.add_argument("--model_path", default="workdir_voc_final/2022-10-31-08-22-37-370565/checkpoints/model_iter_20000.pth", type=str, help="model_path")
 
-parser.add_argument("--backbone", default='vit_base_patch16_224', type=str, help="vit_base_patch16_224")
+parser.add_argument("--backbone", default='vit_base_patch16_384', type=str, help="vit_base_patch16_384")
 parser.add_argument("--data_folder", default='../VOCdevkit/VOC2012', type=str, help="dataset folder")
 parser.add_argument("--list_folder", default='datasets/voc', type=str, help="train/val/test list file")
 parser.add_argument("--num_classes", default=21, type=int, help="number of classes")

@@ -81,17 +81,18 @@ def _img_rescaling(image, depth, label=None, scale=None):
     new_image = Image.fromarray(img8).resize(new_size, resample=Image.BILINEAR)
     new_image = np.asarray(new_image, dtype=np.float32)
 
-    # --- depth: BILINEAR，同步缩放 ---
-    # 支持 HxW 或 HxWx1，保持返回形状与输入一致
-    keep_channel = (depth.ndim == 3 and depth.shape[2] == 1)
-    d = depth.squeeze() if keep_channel else depth
-    d = np.nan_to_num(d, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    # --- depth: BILINEAR, only if depth is provided ---
+    new_depth = None
+    if depth is not None:
+        keep_channel = (depth.ndim == 3 and depth.shape[2] == 1)
+        d = depth.squeeze() if keep_channel else depth
+        d = np.nan_to_num(d, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
 
-    d_img = Image.fromarray(d, mode='F')                   # 32-bit float
-    d_rs  = d_img.resize(new_size, resample=Image.BILINEAR)
-    new_depth = np.asarray(d_rs, dtype=np.float32)
-    if keep_channel:
-        new_depth = new_depth[..., None]
+        d_img = Image.fromarray(d, mode='F')                   # 32-bit float
+        d_rs  = d_img.resize(new_size, resample=Image.BILINEAR)
+        new_depth = np.asarray(d_rs, dtype=np.float32)
+        if keep_channel:
+            new_depth = new_depth[..., None]
 
     if label is None:
         return new_image, new_depth
@@ -128,21 +129,53 @@ def random_resize(image, label=None, size_range=None):
     return _img_rescaling(image, label, scale=new_scale)
 
 
-def random_fliplr(image, label=None, depth=None):
+def random_fliplr(image, label=None, depth=None, normal=None, sam_mask=None):
+    """
+    随机水平翻转增强 (Random Horizontal Flip)
+    同步翻转 Image, Label, Depth, Normal 和 SAM Mask
+    """
     p = random.random()
 
-    if label is None:
-        if p > 0.5:
-            image = np.fliplr(image)
-            depth = np.fliplr(depth)
-        return image, depth
-    else:
-        if p > 0.5:
-            image = np.fliplr(image)
-            label = np.fliplr(label)
-            depth = np.fliplr(depth)
+    if p > 0.5:
+        # 1. 图像翻转 (增加 .copy() 以解决负步长问题)
+        image = np.fliplr(image).copy()
 
-        return image, label, depth
+        if label is not None:
+            label = np.fliplr(label).copy()
+
+        if depth is not None:
+            depth = np.fliplr(depth).copy()
+
+        if normal is not None:
+            normal = np.fliplr(normal).copy()
+            # 法线翻转修正：
+            # 假设 normal 范围是 [0, 1]，水平翻转后 x 分量 (index 0) 需要关于 0.5 对称翻转
+            # 即: new_x = 1.0 - old_x
+            # (如果您的 normal 是 [-1, 1] 范围，请改为 normal[:, :, 0] *= -1)
+            normal[:, :, 0] = 1.0 - normal[:, :, 0]
+
+        if sam_mask is not None:
+            sam_mask = np.fliplr(sam_mask).copy()
+
+    # =========================================================
+    # 动态返回值 (根据输入参数决定返回内容)
+    # =========================================================
+
+    # 场景 A: 有 SAM Mask
+    if sam_mask is not None:
+        if label is not None:
+            # 完整返回: image, label, depth, normal, sam_mask
+            return image, label, depth, normal, sam_mask
+        else:
+            # 无 Label (例如 Cls Dataset): image, depth, normal, sam_mask
+            return image, depth, normal, sam_mask
+
+    # 场景 B: 无 SAM Mask (兼容旧代码)
+    else:
+        if label is None:
+            return image, depth, normal
+        else:
+            return image, label, depth, normal
 
 
 def random_flipud(image, label=None):
@@ -189,19 +222,19 @@ def preprocess_depth(depth_hw, q_low=1, q_high=99):
     return d01
 
 
-def random_crop_rgbd(image, label, depth,
+import numpy as np
+
+
+def random_crop_rgbd(image, label, depth, normal, sam_mask=None,
                      crop_size=512,
                      mean_rgb=(123.675, 116.28, 103.53),
                      ignore_index=255,
                      depth_pad_strategy='edge'):
     """
-    同步对 image/label/depth 做随机裁剪，保证几何对齐且无平移偏差
-    image: HxWx3 uint8
-    label: HxW uint8/int (可 None)
-    depth: HxW 或 HxWx1 float32
-    返回: crop_image(HxWx3), crop_label(HxW 或 None), crop_depth(HxWx1), img_box
+    同步对 image/label/depth/normal/sam_mask 做随机裁剪
+    增加 sam_mask 支持，填充默认为 0
     """
-    # --- 统一 depth 形状 ---
+    # --- 1. 统一 depth 形状 (去掉最后一维) ---
     if depth.ndim == 3 and depth.shape[2] == 1:
         d = depth[..., 0].astype(np.float32)
     elif depth.ndim == 2:
@@ -210,19 +243,25 @@ def random_crop_rgbd(image, label, depth,
         raise ValueError(f"Unexpected depth shape: {depth.shape}")
 
     h, w = image.shape[:2]
-    # 裁剪窗口最终的画布大小（若原图小则先 pad 到至少 crop_size）
+
+    # --- 2. 确定画布大小 ---
     if isinstance(crop_size, (tuple, list)):
         ch, cw = int(crop_size[0]), int(crop_size[1])
     else:
         ch = cw = int(crop_size)
     H, W = max(ch, h), max(cw, w)
 
-    # --- 生成统一的随机偏移（左上角放置位置）---
-    # 这两个随机数 **必须被 image/label/depth 公用**
+    # --- 3. 生成统一偏移量 (所有图公用) ---
     Hp = int(np.random.randint(0, H - h + 1))
     Wp = int(np.random.randint(0, W - w + 1))
 
-    # ---------- pad image ----------
+    # 计算 Padding 的上下左右距离
+    pad_top = Hp
+    pad_bottom = H - h - Hp
+    pad_left = Wp
+    pad_right = W - w - Wp
+
+    # ---------- Pad Image (RGB用均值填补) ----------
     C = image.shape[2]
     pad_image = np.zeros((H, W, C), dtype=np.uint8)
     pad_image[..., 0] = mean_rgb[0]
@@ -230,20 +269,22 @@ def random_crop_rgbd(image, label, depth,
     pad_image[..., 2] = mean_rgb[2]
     pad_image[Hp:Hp + h, Wp:Wp + w, :C] = image
 
-    # ---------- pad label ----------
+    # ---------- Pad Label (用ignore_index填补) ----------
     pad_label = None
     if label is not None:
         pad_label = np.full((H, W), ignore_index, dtype=np.uint8)
         pad_label[Hp:Hp + h, Wp:Wp + w] = label
 
-    # ---------- pad depth（关键！与 Hp/Wp 完全同步） ----------
+    # ---------- Pad SAM Mask (新增，用 0 填补) ----------
+    pad_sam_mask = None
+    if sam_mask is not None:
+        # SAM Mask 通常是 int 类型，0 表示背景
+        pad_sam_mask = np.full((H, W), -1, dtype=sam_mask.dtype)
+        pad_sam_mask[Hp:Hp + h, Wp:Wp + w] = sam_mask
+
+    # ---------- Pad Depth (几何图推荐用 edge) ----------
     if depth_pad_strategy == 'edge':
-        # 用 np.pad 的方式能“按四边”补，且不会引入平移
-        top = Hp
-        left = Wp
-        bottom = H - h - Hp
-        right = W - w - Wp
-        pad_depth = np.pad(d, ((top, bottom), (left, right)), mode='edge')
+        pad_depth = np.pad(d, ((pad_top, pad_bottom), (pad_left, pad_right)), mode='edge')
     elif depth_pad_strategy == 'lowq':
         q1 = float(np.quantile(d, 0.01))
         pad_depth = np.ones((H, W), dtype=np.float32) * q1
@@ -254,38 +295,59 @@ def random_crop_rgbd(image, label, depth,
     else:
         raise ValueError(f"Unknown depth_pad_strategy: {depth_pad_strategy}")
 
-    # --- 采样裁剪窗口（与原 label 逻辑一致）---
+    pad_normal = np.pad(normal,
+                        ((pad_top, pad_bottom), (pad_left, pad_right), (0, 0)),
+                        mode='edge')
+
+    # --- 4. 采样裁剪窗口 ---
     def get_random_cropbox(_label, cat_max_ratio=0.75):
+        # 如果没有 label，直接随机裁
+        if _label is None:
+            H_start = np.random.randint(0, H - ch + 1)
+            W_start = np.random.randint(0, W - cw + 1)
+            return H_start, H_start + ch, W_start, W_start + cw
+
+        # 尝试 10 次，寻找包含前景且单一类别占比不过高的区域
         for _ in range(10):
             H_start = np.random.randint(0, H - ch + 1)
             W_start = np.random.randint(0, W - cw + 1)
             H_end, W_end = H_start + ch, W_start + cw
-            if _label is None:
-                return H_start, H_end, W_start, W_end
+
             tmp = _label[H_start:H_end, W_start:W_end]
             idx, cnt = np.unique(tmp, return_counts=True)
-            # 排除 ignore 区后，避免单类过多
             if ignore_index is not None:
                 cnt = cnt[idx != ignore_index]
+
             if len(cnt) > 1 and (np.max(cnt) / (np.sum(cnt) + 1e-6) < cat_max_ratio):
                 return H_start, H_end, W_start, W_end
-        # 兜底
+
         return H_start, H_end, W_start, W_end
 
     Hs, He, Ws, We = get_random_cropbox(pad_label)
 
+    # --- 5. 执行裁剪 ---
     crop_image = pad_image[Hs:He, Ws:We, :]
     crop_label = None if pad_label is None else pad_label[Hs:He, Ws:We]
-    crop_depth = pad_depth[Hs:He, Ws:We][..., None]  # 回到 HxWx1
+    crop_depth = pad_depth[Hs:He, Ws:We][..., None]
+    crop_normal = pad_normal[Hs:He, Ws:We, :]
 
-    # 记录“原图在 crop 内的有效区域”，可用于可视化检查
+    # 裁剪 SAM Mask
+    crop_sam_mask = None
+    if pad_sam_mask is not None:
+        crop_sam_mask = pad_sam_mask[Hs:He, Ws:We]
+
+    # 记录有效区域框
     img_H_start = max(Hp - Hs, 0)
     img_W_start = max(Wp - Ws, 0)
     img_H_end = min(ch, h + Hp - Hs)
     img_W_end = min(cw, w + Wp - Ws)
     img_box = np.asarray([img_H_start, img_H_end, img_W_start, img_W_end], dtype=np.int16)
 
-    return crop_image, crop_label, crop_depth, img_box
+    # --- 6. 动态返回 ---
+    if sam_mask is not None:
+        return crop_image, crop_label, crop_depth, crop_normal, crop_sam_mask, img_box
+    else:
+        return crop_image, crop_label, crop_depth, crop_normal, img_box
 
 
 

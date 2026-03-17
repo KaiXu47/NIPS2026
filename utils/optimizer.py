@@ -1,10 +1,20 @@
 import torch
 
 import numpy as np
-
 class CosWarmupAdamW(torch.optim.AdamW):
 
-    def __init__(self, params, lr, weight_decay, betas, warmup_iter=None, max_iter=None, warmup_ratio=None, power=None, **kwargs):
+    def __init__(
+        self,
+        params,
+        lr,
+        weight_decay,
+        betas,
+        warmup_iter=None,
+        max_iter=None,
+        warmup_ratio=None,
+        power=None,
+        **kwargs
+    ):
         super().__init__(params, lr=lr, betas=betas, weight_decay=weight_decay, eps=1e-8,)
 
         self.global_step = 0
@@ -37,7 +47,18 @@ class CosWarmupAdamW(torch.optim.AdamW):
 
 class PolyWarmupAdamW(torch.optim.AdamW):
 
-    def __init__(self, params, lr, weight_decay, betas, warmup_iter=None, max_iter=None, warmup_ratio=None, power=None, **kwargs):
+    def __init__(
+        self,
+        params,
+        lr,
+        weight_decay,
+        betas,
+        warmup_iter=None,
+        max_iter=None,
+        warmup_ratio=None,
+        power=None,
+        **kwargs
+    ):
         super().__init__(params, lr=lr, betas=betas, weight_decay=weight_decay, eps=1e-8,)
 
         self.global_step = 0
@@ -50,13 +71,13 @@ class PolyWarmupAdamW(torch.optim.AdamW):
 
     def step(self, closure=None):
         ## adjust lr
-        if self.global_step < self.warmup_iter:
+        # if self.global_step < self.warmup_iter:
 
-            lr_mult = 1 - (1 - self.global_step / self.warmup_iter) * (1 - self.warmup_ratio)
-            for i in range(len(self.param_groups)):
-                self.param_groups[i]['lr'] = self.__init_lr[i] * lr_mult
+        #     lr_mult = 1 - (1 - self.global_step / self.warmup_iter) * (1 - self.warmup_ratio)
+        #     for i in range(len(self.param_groups)):
+        #         self.param_groups[i]['lr'] = self.__init_lr[i] * lr_mult
 
-        elif self.global_step < self.max_iter: 
+        if self.global_step < self.max_iter: 
 
             lr_mult = (1 - self.global_step / self.max_iter) ** self.power
             for i in range(len(self.param_groups)):

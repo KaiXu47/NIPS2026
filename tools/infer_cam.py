@@ -24,7 +24,7 @@ parser.add_argument("--bkg_thre", default=0.5, type=float, help="work_dir")
 
 parser.add_argument("--model_path", default=".", type=str, help="model_path")
 
-parser.add_argument("--backbone", default='vit_base_patch16_224', type=str, help="vit_base_patch16_224")
+parser.add_argument("--backbone", default='vit_base_patch16_384', type=str, help="vit_base_patch16_384")
 parser.add_argument("--pooling", default='gmp', type=str, help="pooling choice for patch tokens")
 parser.add_argument("--pretrained", default=True, type=bool, help="use imagenet pretrained weights")
 

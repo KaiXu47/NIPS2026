@@ -18,7 +18,7 @@ from utils.camutils import get_valid_cam
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model_path", default="./", type=str, help="model_path")
-parser.add_argument("--backbone", default='vit_base_patch16_224', type=str, help="vit_base_patch16_224")
+parser.add_argument("--backbone", default='vit_base_patch16_384', type=str, help="vit_base_patch16_384")
 parser.add_argument("--pooling", default='gmp', type=str, help="pooling choice for patch tokens")
 parser.add_argument("--data_folder", default='../VOCdevkit/VOC2012', type=str, help="dataset folder")
 parser.add_argument("--list_folder", default='datasets/voc', type=str, help="train/val/test list file")

@@ -19,7 +19,6 @@ We proposed Token Contrast to address the over-smoothing issue and further lever
 <summary>
 VOC dataset
 </summary>
-
 #### 1. Download
 
 ``` bash
@@ -104,9 +103,9 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.launch --nproc_per_node
 To evaluation:
 ```bash
 ## for VOC
-python tools/infer_seg_voc.py --model_path $model_path --backbone vit_base_patch16_224 --infer val
+python tools/infer_seg_voc.py --model_path $model_path --backbone vit_base_patch16_384 --infer val
 ## for COCO
-CUDA_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.launch --nproc_per_node=4 --master_port=29501 tools/infer_seg_voc.py --model_path $model_path --backbone vit_base_patch16_224 --infer val
+CUDA_VISIBLE_DEVICES=0,1,2,3 python -m torch.distributed.launch --nproc_per_node=4 --master_port=29501 tools/infer_seg_voc.py --model_path $model_path --backbone vit_base_patch16_384 --infer val
 ```
 <!-- You should get the training logs by running the above commands. Also, check our training log under `logs/`. -->
 

@@ -1,7 +1,7 @@
 import datetime
 import logging
 import torch.distributed as dist
-from datasets import voc as voc
+from datasets import ade as ade
 import os.path as osp
 import tasks
 from model.model_seg_neg import network
@@ -38,15 +38,15 @@ class Trainer:
             step = args.step + 1
         )
         self.device = torch.device(args.local_rank)
-        self.total_classes = sum(task_classes) - 1
+        # ADE total classes are 150 (mapped to 0-149).
+        # sum(task_classes) will be 100 in step 0, 110 in step 1, etc.
+        self.total_classes = sum(task_classes) # Changed: total classes observed so far
         self.new_classes = task_classes[-1]
         self.old_classes = self.total_classes - self.new_classes
-        self.new_classes_origin_weight = 0
-        self.new_classes_origin_idx = 0
 
-        if args.step == 0:  # if step 0, we don't need to instance the model_old
+        if args.step == 0:
             self.model_old = None
-        else:  # instance model_old
+        else:
             old_task_classes = tasks.get_per_task_classes(
                 args.dataset, args.task, args.step - 1
             )
@@ -68,47 +68,34 @@ class Trainer:
                 par.requires_grad = False
             self.model_old.eval()
 
-
-            # Apply replace_mlp_with_cms to self.model
             self.model = replace_mlp_with_cms(self.model, step=self.step)
+
+        # 加载离线相似度矩阵用于动态 Margin
+        if os.path.exists("datasets/ade/clip_similarity_matrix.npy"):
+            self.clip_sim_matrix = torch.from_numpy(np.load("datasets/ade/clip_similarity_matrix.npy")).cuda()
+            logging.info("[!] Successfully loaded CLIP similarity matrix for Dynamic Margin.")
+        else:
+            self.clip_sim_matrix = None
+            logging.warning("[!] CLIP similarity matrix not found. Using fixed margin.")
 
         param_groups = self.model.get_param_groups()
         self.optimizer = self.get_optimizer(args, param_groups)
 
     def get_optimizer(self, args, param_groups):
-        from model.backbone.vit import get_cms_param_groups
-        # param_groups[0] is backbone
-        # param_groups[1] is decoder/heads
-        
-        # We need to filter CMS mlp specific learning rates 
-        # from the backbone parameters if step > 0
         optim_params = []
-        if args.step > 0:
-            cms_param_groups = get_cms_param_groups(self.model.encoder, args.lr)
-            # Add CMS-specific parameter groups
-            for group in cms_param_groups:
-                group['weight_decay'] = args.wt_decay
-                optim_params.append(group)
-            
-            # Now add the decoder parameters (param_groups[1])
-            optim_params.append({
-                "params": param_groups[1],
-                "lr": args.lr * 10,
-                "weight_decay": args.wt_decay,
-            })
-        else:
-            optim_params = [
-                {
-                    "params": param_groups[0],
-                    "lr": args.lr,
-                    "weight_decay": args.wt_decay,
-                },
-                {
-                    "params": param_groups[1],
-                    "lr": args.lr * 10,
-                    "weight_decay": args.wt_decay,
-                },
-            ]
+        
+        from model.backbone.vit import get_cms_param_groups
+        # Use LLRD (get_cms_param_groups) for all steps (including step 0)
+        cms_param_groups = get_cms_param_groups(self.model.encoder, args.lr)
+        for group in cms_param_groups:
+            group['weight_decay'] = args.wt_decay
+            optim_params.append(group)
+        
+        optim_params.append({
+            "params": param_groups[1],
+            "lr": args.lr * 10,
+            "weight_decay": args.wt_decay,
+        })
 
         optim = getattr(optimizer, args.optimizer)(
             params=optim_params,
@@ -121,86 +108,107 @@ class Trainer:
         return optim
 
     def load_step_ckpt(self, path, step_0_checkpoints=None):
-        # generate model from path
         if osp.exists(path):
-            
             step_checkpoint = torch.load(path, map_location="cpu")
             if self.step == 1:
                 state_dict = remap_cms_state_dict(step_checkpoint['model_state'], self.step)
                 self.model.load_state_dict(state_dict, strict=False)
-
-                self.model_old.load_state_dict(
-                step_checkpoint['model_state'], strict=True
-                )  
-                
-            else:
-                self.model.load_state_dict(
-                    step_checkpoint['model_state'], strict=False
-                )  # False for incr. classifiers
-
                 self.model_old.load_state_dict(
                     step_checkpoint['model_state'], strict=True
-                )  # Load also here old parameters
+                )  
+            else:
+                state_dict = remap_cms_state_dict(
+                    step_checkpoint['model_state'], step=self.step
+                )
+                self.model.load_state_dict(state_dict, strict=False)
+                self.model_old.load_state_dict(
+                    step_checkpoint['model_state'], strict=True
+                )
                 self.model = sync_cms_weights(self.model, sync_mode='none')
 
             logging.info(f"[!] Previous model loaded from {path}")
-            # clean memory
             del step_checkpoint['model_state']
         elif osp.exists(step_0_checkpoints):
             step_checkpoint = torch.load(step_0_checkpoints, map_location="cpu")
-            self.model.load_state_dict(
-                step_checkpoint['model_state'], strict=False
-            )  # False for incr. classifiers
+            state_dict = remap_cms_state_dict(
+                step_checkpoint['model_state'], step=self.step
+            )
+            self.model.load_state_dict(state_dict, strict=False)
             self.model_old.load_state_dict(
                 step_checkpoint['model_state'], strict=True
-            )  # Load also here old parameters
-
+            )
             logging.info(f"[!] step_0 model loaded from {step_0_checkpoints}")
             del step_checkpoint['model_state']
-
         else:
-            logging.info(
-                f"[!] WARNING: Unable to find of step {self.args.step - 1}! "
-                f"Do you really want to do from scratch?"
-            )
-
+            logging.info(f"[!] WARNING: Unable to find step {self.args.step - 1} checkpoint!")
 
     def validate(self, model=None, data_loader=None, args=None):
         preds, gts = [], []
         model.eval()
+
+        # Define TTA scales and flip
+        if args.ms_val:
+            scales = [0.75, 1.0, 1.25]
+            flip = True
+        else:
+            scales = [1.0]
+            flip = False
 
         with torch.no_grad():
             for i, data in tqdm(
                 enumerate(data_loader), total=len(data_loader), ncols=100, ascii=" >="
             ):
                 name, inputs, labels = data
-
-                inputs = inputs[:, :3, :, :].cuda()
+                inputs = inputs.cuda()
                 labels = labels.cuda()
-                model_inputs = F.interpolate(
-                    inputs,
-                    size=[args.crop_size, args.crop_size],
-                    mode='bilinear',
-                    align_corners=False
-                )
-                fmap, type_seg, P, delta_p, p_final = model(model_inputs)
+                
+                h, w = labels.shape[1], labels.shape[2]
+                # Initialize ensemble logits on GPU
+                ensemble_logits = torch.zeros((1, self.total_classes, h, w)).cuda()
 
-                resized_segs = F.interpolate(
-                    type_seg, size=labels.shape[1:], mode='bilinear', 
-                    align_corners=False
-                )
-                final_segs_pred = torch.argmax(resized_segs, dim=1)
+                for s in scales:
+                    # 1. Resize input for current scale
+                    # For ViT, we align the size to 16 for better patch embedding interpolation
+                    new_h = int(args.crop_size * s // 16) * 16
+                    new_w = int(args.crop_size * s // 16) * 16
+                    
+                    input_scale = F.interpolate(
+                        inputs, size=(new_h, new_w), 
+                        mode='bilinear', align_corners=False
+                    )
+
+                    # 2. Inference - Original
+                    _, logits, _, _, _, _ = model(input_scale)
+                    logits = F.interpolate(
+                        logits, size=(h, w), 
+                        mode='bilinear', align_corners=False
+                    )
+                    ensemble_logits += F.softmax(logits, dim=1)
+
+                    # 3. Inference - Flip
+                    if flip:
+                        input_flip = torch.flip(input_scale, dims=[3])
+                        _, logits_flip, _, _, _, _ = model(input_flip)
+                        logits_flip = torch.flip(logits_flip, dims=[3]) # Flip output back
+                        logits_flip = F.interpolate(
+                            logits_flip, size=(h, w), 
+                            mode='bilinear', align_corners=False
+                        )
+                        ensemble_logits += F.softmax(logits_flip, dim=1)
+
+                final_segs_pred = torch.argmax(ensemble_logits, dim=1)
 
                 preds += list(final_segs_pred.cpu().numpy().astype(np.int16))
                 gts += list(labels.cpu().numpy().astype(np.int16))
 
-        seg_score = evaluate.scores(gts, preds, self.total_classes + 1)
+        # We evaluate on classes seen so far: 0 to total_classes-1
+        seg_score = evaluate.scores(gts, preds, self.total_classes)
         model.train()
 
         tab_results = format_tabs(
             [seg_score],
             name_list=["Seg_Pred"],
-            cat_list=voc.class_list
+            cat_list=ade.class_list
         )
 
         return tab_results
@@ -215,7 +223,7 @@ class Trainer:
         time0 = datetime.datetime.now()
         time0 = time0.replace(microsecond=0)
 
-        train_dataset = voc.VOC12TrainDataset(
+        train_dataset = ade.ADE20KTrainDataset(
             root_dir=args.data_folder,
             name_list_dir=args.list_folder,
             split=args.train_set,
@@ -223,28 +231,27 @@ class Trainer:
             aug=True,
             crop_size=args.crop_size,
             ignore_index=args.ignore_index,
-            num_classes=args.num_classes,
             tasks=args.task,
             step=args.step,
+            scales=args.scales,
         )
 
-        val_dataset = voc.VOC12SegDataset(
+        val_dataset = ade.ADE20KSegDataset(
             root_dir=args.data_folder,
             name_list_dir=args.list_folder,
             split=args.val_set,
             stage='val',
             aug=False,
             ignore_index=args.ignore_index,
-            num_classes=args.num_classes,
             tasks=args.task,
             step=args.step,
+            scales=args.scales,
         )
 
         train_sampler = DistributedSampler(train_dataset, shuffle=True)
         train_loader = DataLoader(
             train_dataset,
             batch_size=args.spg,
-            # shuffle=True,
             num_workers=args.num_workers,
             pin_memory=False,
             drop_last=True,
@@ -268,10 +275,12 @@ class Trainer:
         train_sampler.set_epoch(np.random.randint(args.max_iters))
         train_loader_iter = iter(train_loader)
         avg_meter = AverageMeter()
+        
+        # Mixed precision GradScaler
+        scaler = torch.cuda.amp.GradScaler()
 
         if self.step == 0:
             for n_iter in range(args.max_iters):
-
                 try:
                     name, inputs, labels = next(train_loader_iter)
                 except StopIteration:
@@ -280,46 +289,62 @@ class Trainer:
                     name, inputs, labels = next(train_loader_iter)
 
                 inputs = inputs.to(device, non_blocking=True)
-                inputs = inputs.cuda()
-                labels = labels.cuda()
-                filter_idx = labels >= self.total_classes + 1
+                labels = labels.cuda().to(torch.long)
+                
+                # Filter classes not in current step
+                filter_idx = labels >= self.total_classes
                 labels[filter_idx] = 255
-                fmap, type_seg, P, delta_p, p_final = model(
-                    inputs
-                )
-                T = 0.1
-                type_seg = F.interpolate(
-                    type_seg, size=labels.shape[1:], mode='bilinear', 
-                    align_corners=False
-                )
-                proto_seg_loss = get_type_seg_loss(
-                    type_seg / T, labels.type(torch.long), 
-                    ignore_index=args.ignore_index
-                )     
-                proto_sep_loss = compute_comprehensive_ortho_loss(
-                    P, p_final, delta_p, mode='cross'
-                )
-                loss = 0.1 * proto_sep_loss + 0.2 * proto_seg_loss
-                optim.zero_grad()
-                loss.backward()
-                optim.step()
+                
+                with torch.cuda.amp.autocast():
+                    fmap, type_seg, P, delta_p, p_final, _ = model(inputs)
+                    # 主分割损失 (CE + Dice) - 模型内部已处理 Logit Scale
+                    type_seg = F.interpolate(
+                        type_seg, size=labels.shape[1:], mode='bilinear', 
+                        align_corners=False
+                    )
+                    proto_seg_loss = get_type_seg_loss(
+                        type_seg, labels, 
+                        ignore_index=args.ignore_index
+                    )     
+                    dice_loss = get_dice_loss(
+                        type_seg, labels, 
+                        ignore_index=args.ignore_index
+                    )
+                    if self.clip_sim_matrix is not None:
+                        # 使用动态 Margin：由 CLIP 相似度决定，上限设为 0.6
+                        proto_sep_loss = compute_dynamic_margin_ortho_loss(
+                            P, self.clip_sim_matrix[:P.size(0), :P.size(0)], max_margin=0.6
+                        )
+                    else:
+                        proto_sep_loss = compute_comprehensive_ortho_loss(
+                            P, p_final, delta_p, mode='all', margin=0.2
+                        )
+                    
+                    # 组合损失：主损失 (1.0) + 分离损失 (0.1)
+                    loss = 0.1 * proto_sep_loss + \
+                           1.0 * (proto_seg_loss + dice_loss)
 
-                # 记录
+                optim.zero_grad()
+                scaler.scale(loss).backward()
+                scaler.step(optim)
+                scaler.update()
+
                 avg_meter.add({
                     'proto_seg_loss': proto_seg_loss,
+                    'dice_loss': dice_loss,
                     'proto_sep_loss': proto_sep_loss,
                 })
 
                 if (n_iter + 1) % args.log_iters == 0:
                     delta, eta = cal_eta(time0, n_iter + 1, args.max_iters)
                     cur_lr = optim.param_groups[0]['lr']
-                    # print(model.module.prototype_module())
                     if args.local_rank == 0:
                         logging.info(
                             "Iter: %d; Elasped: %s; ETA: %s; LR: %.3e; "
-                            "proto_seg_loss: %.4f..., proto_sep_loss: %.4f..." % (
+                            "seg: %.4f, dice: %.4f, sep: %.4f" % (
                                 n_iter + 1, delta, eta, cur_lr,
                                 avg_meter.pop('proto_seg_loss'),
+                                avg_meter.pop('dice_loss'),
                                 avg_meter.pop('proto_sep_loss'),
                             )
                         )
@@ -340,95 +365,98 @@ class Trainer:
 
         else:
             model_old = self.model_old.to(device)            
-
-
             for n_iter in range(args.max_iters):
-
                 try:
-                    (
-                        img_name, inputs, label
-                    ) = next(train_loader_iter)
+                    img_name, inputs, label = next(train_loader_iter)
                 except StopIteration:
                     train_sampler.set_epoch(np.random.randint(args.max_iters))
                     train_loader_iter = iter(train_loader)
-                    (
-                        img_name, inputs, label
-                    ) = next(train_loader_iter)
+                    img_name, inputs, label = next(train_loader_iter)
 
                 inputs = inputs.to(device, non_blocking=True)
                 label = label.to(device, dtype=torch.long, non_blocking=True)
-                old_fmap, type_seg_old, P_old, \
-                delta_p_old, p_final_old = model_old(inputs)
-
-                fmap, type_seg_new, P_new, delta_p_new, p_final_new = model(inputs)
-
-                old_segs = F.interpolate(
-                    type_seg_old, size=[448, 448], mode='bilinear', align_corners=False
-                )
-                old_pixel_label = torch.argmax(old_segs, dim=1)
-
-                filter_old_idx = label <= self.old_classes
-                filter_idx = label >= self.total_classes + 1
-                label[filter_old_idx] = 0
-                label[filter_idx] = 255
-
-                mixed_pseudo_label = label.clone()
-                mask_old = (
-                    (old_pixel_label > 0)
-                    & (old_pixel_label <= self.old_classes)
-                    & (label == 0)
-                )
-                mixed_pseudo_label[mask_old] = old_pixel_label[mask_old]
-
-                T = 0.1
-                type_seg_new = F.interpolate(
-                    type_seg_new, size=mixed_pseudo_label.shape[1:],
-                    mode='bilinear', align_corners=False
-                )
-                proto_seg_loss = get_type_seg_loss(
-                    type_seg_new / T, mixed_pseudo_label.type(torch.long),
-                    ignore_index=args.ignore_index
-                )
                 
-                proto_kd_loss = prototype_kd_loss(P_new, P_old)
+                with torch.cuda.amp.autocast():
+                    with torch.no_grad():
+                        old_fmap, type_seg_old, P_old, \
+                        delta_p_old, p_final_old, _ = model_old(inputs)
 
-                proto_sep_loss = compute_comprehensive_ortho_loss(
-                    P_new, p_final_new, delta_p_new, mode='cross'
-                )
-                prototype_loss = 2 * proto_seg_loss + \
-                1 * proto_kd_loss + 1 * proto_sep_loss
+                    fmap, type_seg_new, P_new, delta_p_new, p_final_new, _ = model(inputs)
 
+                    old_segs = F.interpolate(
+                        type_seg_old, size=label.shape[1:], mode='bilinear', align_corners=False
+                    )
+                    old_pixel_label = torch.argmax(old_segs, dim=1)
 
-                loss = 0.1 * prototype_loss
+                    filter_old_idx = label < self.old_classes
+                    filter_idx = label >= self.total_classes
+                    # ADE has no background class 0, so we ignore old classes in hard loss
+                    # and rely on distillation/pseudo-labeling if implemented.
+                    label[filter_old_idx] = 255 
+                    label[filter_idx] = 255
 
-                if n_iter % 2000 == 0 and n_iter != 0:
-                    if args.local_rank == 0:  # save model at the eval iteration
-                        state = {
-                            "model_state": self.model.state_dict(),
-                        }
-                        path = os.path.join(args.ckpt_dir, f"model_{n_iter}.pth")
+                    mixed_pseudo_label = label.clone()
+                    # ADE20K: label 255 is ignore/void, classes are 0-149.
+                    # old_pixel_label from old model will predict 0-(old_classes-1).
+                    mask_old = (label == 255) & (old_pixel_label < self.old_classes)
+                    mixed_pseudo_label[mask_old] = old_pixel_label[mask_old]
+
+                    type_seg_new = F.interpolate(
+                        type_seg_new, size=mixed_pseudo_label.shape[1:],
+                        mode='bilinear', align_corners=False
+                    )
+                    proto_seg_loss = get_type_seg_loss(
+                        type_seg_new, mixed_pseudo_label,
+                        ignore_index=args.ignore_index
+                    )
+                    dice_loss = get_dice_loss(
+                        type_seg_new, mixed_pseudo_label,
+                        ignore_index=args.ignore_index
+                    )
+                    
+                    proto_kd_loss = prototype_kd_loss(P_new, P_old, skip_bg=False)
+                    if self.clip_sim_matrix is not None:
+                        proto_sep_loss = compute_dynamic_margin_ortho_loss(
+                            P_new, self.clip_sim_matrix[:P_new.size(0), :P_new.size(0)], max_margin=0.6
+                        )
+                    else:
+                        proto_sep_loss = compute_comprehensive_ortho_loss(
+                            P_new, p_final_new, delta_p_new, mode='all', margin=0.2
+                        )
+
+                    prototype_loss = 1 * (proto_seg_loss + dice_loss) + \
+                                     0.1 * proto_kd_loss + 0.1 * proto_sep_loss
+
+                    loss = prototype_loss
+
+                if (n_iter + 1) % args.eval_iters == 0:
+                    if args.local_rank == 0:
+                        state = {"model_state": self.model.state_dict()}
+                        path = os.path.join(args.ckpt_dir, f"model_{n_iter+1}.pth")
                         torch.save(state, path)
-                        logging.info("[!] Checkpoint saved.")
+                        logging.info(f"[!] Checkpoint saved: {path}")
 
                 avg_meter.add({
-                    'proto_seg_loss':proto_seg_loss.item(),
+                    'proto_seg_loss': proto_seg_loss.item(),
+                    'dice_loss': dice_loss.item(),
                     'proto_kd_loss': proto_kd_loss.item(),
                     'proto_sep_loss': proto_sep_loss.item(),
                 })
                 optim.zero_grad()
-                loss.backward()
-                optim.step()
-                if (n_iter + 1) % args.log_iters == 0:
+                scaler.scale(loss).backward()
+                scaler.step(optim)
+                scaler.update()
 
+                if (n_iter + 1) % args.log_iters == 0:
                     delta, eta = cal_eta(time0, n_iter + 1, args.max_iters)
                     cur_lr = optim.param_groups[0]['lr']
-
                     if args.local_rank == 0:
                         logging.info(
                             "Iter: %d; Elasped: %s; ETA: %s; LR: %.3e; "
-                            "proto_seg_loss: %.4f, proto_kd_loss: %.4f, proto_sep_loss: %.4f..." % (
+                            "seg: %.4f, dice: %.4f, kd: %.4f, sep: %.4f" % (
                                 n_iter + 1, delta, eta, cur_lr,
                                 avg_meter.pop('proto_seg_loss'),
+                                avg_meter.pop('dice_loss'),
                                 avg_meter.pop('proto_kd_loss'),
                                 avg_meter.pop('proto_sep_loss')
                             )

@@ -22,7 +22,7 @@ from torch.nn.parallel import DistributedDataParallel
 parser = argparse.ArgumentParser()
 # parser.add_argument("--model_path", default="workdir_coco_final/2022-10-31-14-28-55-573606/checkpoints/model_iter_80000.pth", type=str, help="model_path")
 parser.add_argument("--model_path", default="workdir_coco_final/2022-11-02-22-16-01-448587/checkpoints/model_iter_80000.pth", type=str, help="model_path")
-parser.add_argument("--backbone", default='vit_base_patch16_224', type=str, help="vit_base_patch16_224")
+parser.add_argument("--backbone", default='vit_base_patch16_384', type=str, help="vit_base_patch16_384")
 parser.add_argument("--pooling", default='gmp', type=str, help="pooling choice for patch tokens")
 parser.add_argument("--img_folder", default='../coco2014', type=str, help="dataset folder")
 parser.add_argument("--label_folder", default='../MSCOCO/SegmentationClass', type=str, help="dataset folder")
