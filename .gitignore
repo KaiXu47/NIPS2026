@@ -133,10 +133,8 @@ checkpoints/
 # Precomputed data / Caches
 *.npy
 *.npz
-
-# Precomputed data / Caches
-*.npy
-*.npz
+!datasets/ade/clip_features.npy
+!datasets/ade/clip_similarity_matrix.npy
 
 # Data splits/lists
 # Allowed by removing exclusions: voc_cil_lists, datasets subfolders
