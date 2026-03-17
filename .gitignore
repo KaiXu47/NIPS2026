@@ -134,12 +134,14 @@ checkpoints/
 *.npy
 *.npz
 
+# Precomputed data / Caches
+*.npy
+*.npz
+
 # Data splits/lists
-voc_cil_lists/
-datasets/voc/incremental_split/
-datasets/ade/incremental_split/
-*.txt
+# Allowed by removing exclusions: voc_cil_lists, datasets subfolders
 !README.md
 !requirements.txt
 !*.py
 !*.sh
+!*.txt
